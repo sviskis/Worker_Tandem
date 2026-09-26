@@ -1477,6 +1477,10 @@ class CodexRunner:
             obj = extract_json_object(text)
             if obj is None:
                 continue
+            # Step identity is controller-owned. Codex must never choose or
+            # echo step_no; ignore/remove any model-provided value BEFORE
+            # schema validation so it cannot trip additionalProperties=False.
+            obj.pop("step_no", None)
             problems = validate_against_schema(obj, schema)
             if problems:
                 if not schema_problem:
@@ -1516,7 +1520,6 @@ def codex_plan_schema() -> dict:
         "type": "object",
         "additionalProperties": False,
         "properties": {
-            "step_no": {"type": "integer"},
             "decision": {"type": "string", "enum": ["PLAN_READY", "BLOCKED"]},
             "goal": {"type": "string"},
             "files": {"type": "array", "items": {"type": "string"}},
@@ -1528,7 +1531,6 @@ def codex_plan_schema() -> dict:
             "summary": {"type": "string"},
         },
         "required": [
-            "step_no",
             "decision",
             "goal",
             "files",
@@ -1548,7 +1550,6 @@ def codex_review_schema() -> dict:
         "type": "object",
         "additionalProperties": False,
         "properties": {
-            "step_no": {"type": "integer"},
             "verdict": {
                 "type": "string",
                 "enum": [
@@ -1565,7 +1566,6 @@ def codex_review_schema() -> dict:
             "summary": {"type": "string"},
         },
         "required": [
-            "step_no",
             "verdict",
             "issues",
             "required_changes",
@@ -1659,7 +1659,6 @@ Your job:
 {CODEX_EFFICIENCY_CONTRACT}
 
 Return JSON conforming exactly to the provided output schema.
-step_no must be {step.step_no}.
 """.strip()
 
         output_path = self.db.from_codex / f"step_{step.step_no:03d}_plan.json"
@@ -1676,10 +1675,11 @@ step_no must be {step.step_no}.
             self.db.transition(step.step_no, "FAILED", "Codex PLAN failed.")
             raise
 
-        if int(result.get("step_no", -1)) != step.step_no:
-            self.db.transition(step.step_no, "FAILED", "Codex PLAN step_no mismatch.")
-            raise RuntimeError("Codex PLAN step_no mismatch.")
-
+        # Python/FSM owns step identity. The model's advisory payload must not
+        # carry step_no; the controller injects the authoritative value before
+        # the canonical artifact is published and stored.
+        result["step_no"] = step.step_no
+        write_json_atomic(output_path, result)
         self.db.save_codex_plan(step.step_no, attempt, result)
 
         decision = str(result.get("decision", "BLOCKED"))
@@ -1846,7 +1846,6 @@ ARCHITECTURE_DECISION_REQUIRED = human architecture decision is required.
 {CODEX_EFFICIENCY_CONTRACT}
 
 Return only structured JSON.
-step_no must be {step.step_no}.
 """.strip()
 
         output_path = self.db.from_codex / f"step_{step.step_no:03d}_review.json"
@@ -1864,10 +1863,9 @@ step_no must be {step.step_no}.
             self.db.transition(step.step_no, "FAILED", "Codex REVIEW failed.")
             raise
 
-        if int(review.get("step_no", -1)) != step.step_no:
-            self.db.transition(step.step_no, "FAILED", "Codex REVIEW step_no mismatch.")
-            raise RuntimeError("Codex REVIEW step_no mismatch.")
-
+        # Python/FSM owns step identity (same rule as PLAN).
+        review["step_no"] = step.step_no
+        write_json_atomic(output_path, review)
         self.db.save_codex_review(step.step_no, step.attempt, review)
         verdict = str(review.get("verdict", "")).upper()
 
