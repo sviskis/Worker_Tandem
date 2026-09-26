@@ -105,6 +105,19 @@ REVIEW_CONTEXT_RULES = [
     "verdict=ARCHITECTURE_DECISION_REQUIRED.",
 ]
 
+#: Canonical, human-editable plan document that lives with the project.
+#: Worker_tandem READS it to sync step descriptions; the tandem DB keeps the
+#: active imported/snapshotted execution state, NOT the editable plan. Mini
+#: Worker is no longer the authoritative plan source.
+CANONICAL_PLAN_NAME = "BUILD_PLAN.json"
+
+#: Bounds for the minimized PLAN context. Keep it small: the full current step,
+#: the locked controller rules, only the necessary previous VERIFIED steps, and
+#: reference file NAMES - never repository or document dumps.
+MAX_PREVIOUS_STEPS = 3
+MAX_PREVIOUS_STEP_DESCRIPTION_CHARS = 400
+MAX_PLAN_CONTEXT_CHARS = 20000
+
 TERMINAL_STATES = {"VERIFIED", "SKIPPED", "ABORTED"}
 
 VALID_STATES = {
@@ -196,6 +209,24 @@ def git_capture(project_root: Path, args: list[str], max_chars: int = 120_000) -
         return text[:max_chars]
     except Exception as exc:
         return f"git command failed: {exc}"
+
+
+def is_sufficient_step_description(description: str, title: str = "") -> bool:
+    """Whether a step description is a real task specification.
+
+    A title-only step is NOT sufficient: the planner must never be sent the
+    step title as if it were the task. Empty/whitespace descriptions and a
+    description that normalized-equals the title are rejected.
+    """
+    text = (description or "").strip()
+    if not text:
+        return False
+    if title:
+        norm_desc = " ".join(text.casefold().split())
+        norm_title = " ".join((title or "").strip().casefold().split())
+        if norm_desc == norm_title:
+            return False
+    return True
 
 
 @dataclass(slots=True)
@@ -629,22 +660,23 @@ class TandemDB:
             "steps": len(mini_steps),
         }
 
+    @staticmethod
+    def _row_to_step(row: sqlite3.Row) -> TandemStep:
+        return TandemStep(
+            step_no=int(row["step_no"]),
+            phase=str(row["phase"]),
+            title=str(row["title"]),
+            description=str(row["description"]),
+            state=str(row["state"]),
+            attempt=int(row["attempt"]),
+            max_attempts=int(row["max_attempts"]),
+            risk=str(row["risk"]),
+            requires_human=bool(row["requires_human"]),
+        )
+
     def list_steps(self) -> list[TandemStep]:
         rows = self.db.execute("SELECT * FROM steps ORDER BY step_no").fetchall()
-        return [
-            TandemStep(
-                step_no=int(r["step_no"]),
-                phase=str(r["phase"]),
-                title=str(r["title"]),
-                description=str(r["description"]),
-                state=str(r["state"]),
-                attempt=int(r["attempt"]),
-                max_attempts=int(r["max_attempts"]),
-                risk=str(r["risk"]),
-                requires_human=bool(r["requires_human"]),
-            )
-            for r in rows
-        ]
+        return [self._row_to_step(r) for r in rows]
 
     def current_step(self) -> Optional[TandemStep]:
         row = self.db.execute(
@@ -655,35 +687,38 @@ class TandemDB:
             LIMIT 1
             """
         ).fetchone()
-        if not row:
-            return None
-        return TandemStep(
-            step_no=int(row["step_no"]),
-            phase=str(row["phase"]),
-            title=str(row["title"]),
-            description=str(row["description"]),
-            state=str(row["state"]),
-            attempt=int(row["attempt"]),
-            max_attempts=int(row["max_attempts"]),
-            risk=str(row["risk"]),
-            requires_human=bool(row["requires_human"]),
-        )
+        return self._row_to_step(row) if row else None
 
     def get_step(self, step_no: int) -> TandemStep:
         row = self.db.execute("SELECT * FROM steps WHERE step_no=?", (step_no,)).fetchone()
         if not row:
             raise KeyError(step_no)
-        return TandemStep(
-            step_no=int(row["step_no"]),
-            phase=str(row["phase"]),
-            title=str(row["title"]),
-            description=str(row["description"]),
-            state=str(row["state"]),
-            attempt=int(row["attempt"]),
-            max_attempts=int(row["max_attempts"]),
-            risk=str(row["risk"]),
-            requires_human=bool(row["requires_human"]),
-        )
+        return self._row_to_step(row)
+
+    def latest_plan(self) -> Optional[dict]:
+        """The active snapshotted plan (controller_policy + steps), or None."""
+        row = self.db.execute(
+            "SELECT plan_json FROM plan_versions ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        return json.loads(row["plan_json"]) if row else None
+
+    def plan_policy(self) -> dict:
+        """The locked controller rules of the active plan (may be empty)."""
+        plan = self.latest_plan() or {}
+        policy = plan.get("controller_policy")
+        return dict(policy) if isinstance(policy, dict) else {}
+
+    def previous_verified_steps(self, step_no: int) -> list[TandemStep]:
+        """VERIFIED steps strictly before ``step_no``, oldest first."""
+        rows = self.db.execute(
+            """
+            SELECT * FROM steps
+            WHERE state='VERIFIED' AND step_no < ?
+            ORDER BY step_no
+            """,
+            (step_no,),
+        ).fetchall()
+        return [self._row_to_step(r) for r in rows]
 
     def transition(self, step_no: int, to_state: str, detail: str = "") -> None:
         if to_state not in VALID_STATES:
@@ -817,6 +852,112 @@ class TandemDB:
             )
         return next_no
 
+    def sync_step_description_from_plan(
+        self,
+        plan_path: Path,
+        step_no: Optional[int] = None,
+        *,
+        actor: str = "human",
+        reason: str = "",
+    ) -> dict:
+        """Controlled sync of ONE step description from the canonical plan.
+
+        History-safe by design: it updates ONLY ``steps.description`` for the
+        target (default: current) step and appends exactly one audit event.
+        States, attempts, VERIFIED/PENDING flags, Codex plans and Cline reports
+        are never touched, and the plan is never re-imported. The active plan
+        snapshot (plan_versions + meta) is refreshed so the DB mirrors the
+        canonical document.
+        """
+        plan_path = Path(plan_path)
+        if not plan_path.exists():
+            raise FileNotFoundError(f"Canonical BUILD_PLAN not found: {plan_path}")
+        plan = read_json(plan_path)
+        self._validate_plan(plan)
+
+        target = self.current_step() if step_no is None else self.get_step(step_no)
+        if target is None:
+            raise RuntimeError("No active step to sync.")
+
+        by_no = {int(raw["step_no"]): raw for raw in plan["steps"]}
+        raw = by_no.get(target.step_no)
+        if raw is None:
+            raise RuntimeError(
+                f"Canonical BUILD_PLAN has no step {target.step_no}."
+            )
+        new_description = str(raw.get("description", "")).strip()
+        if not new_description:
+            raise ValueError(
+                f"Canonical BUILD_PLAN step {target.step_no} has an empty description."
+            )
+
+        old_description = target.description
+        old_hash = sha256_text(old_description)
+        new_hash = sha256_text(new_description)
+
+        plan_text = json.dumps(plan, ensure_ascii=False, sort_keys=True, indent=2)
+        plan_hash = sha256_text(plan_text)
+        plan_version = str(plan.get("plan_version", plan.get("version", "")))
+        ts = now_iso()
+        changed = old_description != new_description
+
+        details = json.dumps(
+            {
+                "step_no": target.step_no,
+                "old_description_hash": old_hash,
+                "new_description_hash": new_hash,
+                "changed": changed,
+                "plan_version": plan_version,
+                "plan_hash": plan_hash,
+                "plan_path": str(plan_path),
+                "actor": actor,
+                "reason": reason,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+
+        with self.db:
+            self.db.execute(
+                "UPDATE steps SET description=?, last_update_at=? WHERE step_no=?",
+                (new_description, ts, target.step_no),
+            )
+            if self.get_meta("plan_hash", "") != plan_hash:
+                self.db.execute(
+                    """
+                    INSERT INTO plan_versions(version, plan_hash, plan_json, created_at)
+                    VALUES(?,?,?,?)
+                    """,
+                    (plan_version, plan_hash, plan_text, ts),
+                )
+            for key, value in (
+                ("plan_version", plan_version),
+                ("plan_hash", plan_hash),
+            ):
+                self.db.execute(
+                    """
+                    INSERT INTO meta(key,value) VALUES(?,?)
+                    ON CONFLICT(key) DO UPDATE SET value=excluded.value
+                    """,
+                    (key, value),
+                )
+            self.db.execute(
+                "INSERT INTO events(step_no,event_type,details,created_at) VALUES(?,?,?,?)",
+                (target.step_no, "STEP_DESCRIPTION_SYNCED", details, ts),
+            )
+
+        return {
+            "step_no": target.step_no,
+            "changed": changed,
+            "old_description_hash": old_hash,
+            "new_description_hash": new_hash,
+            "plan_version": plan_version,
+            "plan_hash": plan_hash,
+            "plan_path": str(plan_path),
+            "actor": actor,
+            "reason": reason,
+        }
+
 
 class ContextBuilder:
     #: Paths offered to Codex as references. Only the NAMES are sent; file
@@ -854,16 +995,45 @@ class ContextBuilder:
     def _reference_names(self) -> list[str]:
         return [name for name in self.REFERENCE_FILES if (self.root / name).exists()]
 
-    def project_context(self, step: TandemStep) -> dict:
-        """Minimal PLAN context: current step + rules + reference file NAMES.
+    def _previous_step_block(self, step: TandemStep) -> dict:
+        description = step.description or ""
+        if len(description) > MAX_PREVIOUS_STEP_DESCRIPTION_CHARS:
+            description = (
+                description[:MAX_PREVIOUS_STEP_DESCRIPTION_CHARS]
+                + "...[TRUNCATED BY WORKER_TANDEM]..."
+            )
+        return {
+            "step_no": step.step_no,
+            "phase": step.phase,
+            "title": step.title,
+            "description": description,
+        }
 
-        Full document bodies and repository listings are deliberately NOT
-        included; Codex reads only what this step needs.
+    def project_context(self, step: TandemStep) -> dict:
+        """Minimal but COMPLETE PLAN context for the current step.
+
+        Carries the FULL current step (never title-only), the locked controller
+        rules of the active plan, only the necessary previous VERIFIED steps,
+        and reference file NAMES. Full document bodies, repository listings and
+        unrelated history are deliberately NOT included; Codex reads only what
+        this step needs.
         """
+        if not is_sufficient_step_description(step.description, step.title):
+            raise ValueError(
+                f"Step {step.step_no} has no usable description (empty or "
+                "title-only); refusing to send a non-task to Codex."
+            )
+
+        previous = self.db.previous_verified_steps(step.step_no)
+        if len(previous) > MAX_PREVIOUS_STEPS:
+            previous = previous[-MAX_PREVIOUS_STEPS:]
+
         return {
             "worker": {"name": APP_NAME, "version": APP_VERSION},
             "project_root": str(self.root),
             "step": self._step_block(step),
+            "controller_policy": self.db.plan_policy(),
+            "previous_steps": [self._previous_step_block(s) for s in previous],
             "rules": PLAN_CONTEXT_RULES,
             "reference_files": self._reference_names(),
         }
@@ -1203,18 +1373,26 @@ class CodexRunner:
         except Exception:
             return False
 
+    #: Positional prompt marker that makes `codex exec` read the prompt from
+    #: stdin. The prompt MUST be delivered this way: on Windows the Codex CLI is
+    #: usually an npm `.CMD` shim that re-parses its arguments through cmd.exe,
+    #: and a multi-line argument is truncated at the first newline - only the
+    #: first line would ever reach the model.
+    STDIN_PROMPT = "-"
+
     def build_command(
         self,
-        prompt: str,
         schema_path: Path,
         output_path: Path,
         reasoning_effort: Optional[str] = None,
     ) -> list[str]:
         """Build the `codex exec` command for a structured run.
 
-        `-o` always points at a temporary, non-final filename. We never pass
-        --full-auto: PLAN/REVIEW must run in a read-only sandbox. Reasoning
-        effort is set explicitly via -c model_reasoning_effort="...".
+        The prompt is deliberately NOT part of the command line; the caller
+        streams it to stdin (see :data:`STDIN_PROMPT`). `-o` always points at a
+        temporary, non-final filename. We never pass --full-auto: PLAN/REVIEW
+        must run in a read-only sandbox. Reasoning effort is set explicitly via
+        -c model_reasoning_effort="...".
         """
         exe = self.resolved_executable()
         if not exe:
@@ -1241,7 +1419,7 @@ class CodexRunner:
             cmd.append("--skip-git-repo-check")
         if self.model:
             cmd += ["-m", str(self.model)]
-        cmd.append(prompt)
+        cmd.append(self.STDIN_PROMPT)
         return cmd
 
     def _failure_report(
@@ -1373,13 +1551,22 @@ class CodexRunner:
             pass
 
         effort = reasoning_effort or self.reasoning_effort
-        cmd = self.build_command(prompt, schema_path, temp_output, effort)
+        cmd = self.build_command(schema_path, temp_output, effort)
         timeout = timeout_sec or self.timeout_sec
+        # The prompt travels on stdin, never as an argv element: on Windows the
+        # Codex `.CMD` shim re-parses argv through cmd.exe and truncates a
+        # multi-line prompt at its first newline.
+        prompt_info = {
+            "prompt_via": "stdin",
+            "prompt_chars": len(prompt),
+            "prompt": prompt,
+        }
 
         try:
             cp = subprocess.run(
                 cmd,
                 cwd=str(self.project_root),
+                input=prompt,
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
@@ -1392,6 +1579,7 @@ class CodexRunner:
                 trace_path,
                 {
                     "command": cmd,
+                    **prompt_info,
                     "returncode": None,
                     "timeout_sec": timeout,
                     "reasoning_effort": effort,
@@ -1415,6 +1603,7 @@ class CodexRunner:
                 trace_path,
                 {
                     "command": cmd,
+                    **prompt_info,
                     "returncode": cp.returncode,
                     "timeout_sec": timeout,
                     "reasoning_effort": effort,
@@ -1593,6 +1782,25 @@ class TandemController:
     def migrate_from_mini(self) -> dict:
         return self.db.migrate_from_mini()
 
+    def canonical_plan_path(self) -> Path:
+        """The human-editable plan document that lives with the project."""
+        return self.db.project_root / CANONICAL_PLAN_NAME
+
+    def sync_current_step_description_from_plan(
+        self, actor: str = "human", reason: str = ""
+    ) -> dict:
+        """Sync the CURRENT step description from the canonical BUILD_PLAN.json.
+
+        History-safe: no plan re-import, no attempt/state reset; the operation
+        only refreshes the step description and records an audit event.
+        """
+        return self.db.sync_step_description_from_plan(
+            self.canonical_plan_path(),
+            None,
+            actor=actor,
+            reason=reason,
+        )
+
     def _codex_reasoning_effort(self, step: TandemStep) -> str:
         """Reasoning-effort policy for PLAN and REVIEW.
 
@@ -1613,6 +1821,14 @@ class TandemController:
             raise RuntimeError("No active step.")
         if step.state != "READY_FOR_CODEX_PLAN":
             raise RuntimeError(f"Current state must be READY_FOR_CODEX_PLAN, got {step.state}")
+
+        # Guard BEFORE any state mutation: a title-only (or empty) description
+        # is not a task and must never be sent to Codex.
+        if not is_sufficient_step_description(step.description, step.title):
+            raise RuntimeError(
+                f"Step {step.step_no} description is empty or title-only; "
+                f"sync it from {CANONICAL_PLAN_NAME} before running Codex PLAN."
+            )
 
         attempt = self.db.increment_attempt(step.step_no)
         self.db.transition(step.step_no, "CODEX_PLAN_RUNNING", f"attempt={attempt}")
@@ -2033,6 +2249,13 @@ class TandemGUI:
         )
         self.btn_repair.grid(row=2, column=1, padx=4, pady=4, sticky="ew")
 
+        self.btn_sync = ttk.Button(
+            actions,
+            text=f"Sync STEP description from {CANONICAL_PLAN_NAME}",
+            command=self.sync_from_canonical_plan,
+        )
+        self.btn_sync.grid(row=2, column=0, padx=4, pady=4, sticky="ew")
+
         for i in range(3):
             actions.columnconfigure(i, weight=1)
 
@@ -2117,6 +2340,35 @@ class TandemGUI:
                 f"Current step: {result['current_step']}",
             )
             self.footer_var.set("Mini Worker state imported read-only.")
+            self.refresh()
+        except Exception as exc:
+            messagebox.showerror(APP_NAME, str(exc))
+
+    def sync_from_canonical_plan(self) -> None:
+        if not self.controller:
+            return
+        path = self.controller.canonical_plan_path()
+        if not messagebox.askyesno(
+            APP_NAME,
+            "Update the current step description from the canonical plan?\n\n"
+            f"Source: {path}\n\n"
+            "Attempts, events, VERIFIED/PENDING steps and Codex/Cline history "
+            "are preserved. The plan is NOT re-imported.\n\nContinue?",
+        ):
+            return
+        try:
+            result = self.controller.sync_current_step_description_from_plan(
+                reason="Manual sync from canonical BUILD_PLAN.json."
+            )
+            messagebox.showinfo(
+                APP_NAME,
+                "STEP description synced.\n\n"
+                f"Step: {result['step_no']}\n"
+                f"Changed: {result['changed']}\n"
+                f"Plan: v{result['plan_version']} ({result['plan_hash'][:12]})\n"
+                f"New description hash: {result['new_description_hash'][:12]}",
+            )
+            self.footer_var.set("STEP description synced from canonical plan.")
             self.refresh()
         except Exception as exc:
             messagebox.showerror(APP_NAME, str(exc))
@@ -2377,6 +2629,12 @@ class TandemGUI:
         set_state(self.btn_review, state == "CLINE_REPORT_RECEIVED")
         set_state(self.btn_accept, state == "REVIEW_APPROVED")
         set_state(self.btn_repair, state == "REVISE")
+
+        # Canonical-plan sync is a manual maintenance action: allowed whenever a
+        # project is open and no background job is running.
+        self.btn_sync.configure(
+            state=("normal" if self.controller and not self.busy else "disabled")
+        )
 
     def on_close(self) -> None:
         try:
