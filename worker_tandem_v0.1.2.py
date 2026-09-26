@@ -76,6 +76,29 @@ VALID_CODEX_REASONING = {
     CODEX_REASONING_HIGH,
 }
 
+#: Cline report readiness watcher (GUI, Tk-safe polling).
+#: The watcher only ever inspects the exact expected report path for the
+#: current STEP; it never scans the filesystem and adds no dependency.
+CLINE_REPORT_POLL_MS = 2500
+
+#: Hard cap so a stray/large file can never make the poll heavy.
+CLINE_REPORT_MAX_BYTES = 1_048_576
+
+#: Terminal statuses a Cline report may carry.
+CLINE_REPORT_VALID_STATUSES = ("DONE", "REVISE", "BLOCKED", "FAILED")
+
+#: Footer strings owned by the Cline-report watcher. The watcher may only
+#: overwrite the footer with one of these (or when the footer is empty), so it
+#: can never clobber a Codex PLAN/REVIEW or other foreground progress message.
+WATCHER_FOOTER_WAITING = "Waiting for Cline report..."
+WATCHER_FOOTER_READY = 'Cline report ready — click "Process Cline Report".'
+WATCHER_FOOTER_INVALID = "Cline report invalid — waiting for replacement..."
+WATCHER_FOOTER_MESSAGES = {
+    WATCHER_FOOTER_WAITING,
+    WATCHER_FOOTER_READY,
+    WATCHER_FOOTER_INVALID,
+}
+
 #: Shared, mandatory prompt contract that keeps Codex cheap and to the point.
 CODEX_EFFICIENCY_CONTRACT = """\
 EFFICIENCY CONTRACT (mandatory):
@@ -1262,6 +1285,35 @@ def validate_against_schema(value: Any, schema: Any, path: str = "$") -> list[st
     return problems
 
 
+def validate_cline_report(report: Any, step_no: int) -> list[str]:
+    """Pure readiness/validation check for a Cline report object.
+
+    Shared by the GUI readiness watcher and
+    ``TandemController.process_cline_report`` so both always agree: the button
+    can never be enabled for a report the FSM would then reject.
+
+    Returns a list of human-readable problems; an empty list means READY. Pure
+    and side-effect free: it only inspects the already-parsed JSON object (no
+    file I/O, no FSM mutation).
+    """
+    if not isinstance(report, dict):
+        return ["Cline report must be a JSON object."]
+
+    try:
+        report_step_no = int(report.get("step_no", -1))
+    except (TypeError, ValueError):
+        report_step_no = -1
+    if report_step_no != step_no:
+        # Step identity is authoritative; stop before schema noise.
+        return ["Cline report step_no mismatch."]
+
+    status = str(report.get("status", "")).upper()
+    if status not in CLINE_REPORT_VALID_STATUSES:
+        return [f"Invalid Cline report status: {status}"]
+
+    return validate_against_schema(report, cline_report_schema())
+
+
 def looks_like_transport_failure(text: str) -> bool:
     lowered = (text or "").lower()
     return any(marker in lowered for marker in CODEX_TRANSPORT_MARKERS)
@@ -1765,6 +1817,52 @@ def codex_review_schema() -> dict:
     }
 
 
+def cline_report_schema() -> dict:
+    """JSON Schema for the Cline ACT/REPAIR report artifact.
+
+    Mirrors the ``report_schema`` advertised to Cline in the dispatched task.
+    Extra keys are tolerated; only the required/typed keys are enforced. Python
+    owns step identity, so ``step_no`` is additionally matched against the
+    current step by :func:`validate_cline_report`.
+    """
+    return {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "properties": {
+            "step_no": {"type": "integer"},
+            "status": {"type": "string", "enum": list(CLINE_REPORT_VALID_STATUSES)},
+            "files_created": {"type": "array", "items": {"type": "string"}},
+            "files_changed": {"type": "array", "items": {"type": "string"}},
+            "files_deleted": {"type": "array", "items": {"type": "string"}},
+            "tests": {
+                "type": "object",
+                "properties": {
+                    "passed": {"type": "integer"},
+                    "failed": {"type": "integer"},
+                    "command": {"type": "string"},
+                },
+                "required": ["passed", "failed", "command"],
+            },
+            "dependencies_added": {"type": "array", "items": {"type": "string"}},
+            "architecture_questions": {"type": "array", "items": {"type": "string"}},
+            "issues": {"type": "array", "items": {"type": "string"}},
+            "summary": {"type": "string"},
+        },
+        "required": [
+            "step_no",
+            "status",
+            "files_created",
+            "files_changed",
+            "files_deleted",
+            "tests",
+            "dependencies_added",
+            "architecture_questions",
+            "issues",
+            "summary",
+        ],
+    }
+
+
 class TandemController:
     def __init__(self, project_root: Path):
         self.db = TandemDB(project_root)
@@ -1966,6 +2064,104 @@ Return JSON conforming exactly to the provided output schema.
         self.db.event(step.step_no, "CLINE_TASK_WRITTEN", str(task_path))
         return task_path
 
+    def expected_cline_report_path(self, step_no: int) -> Path:
+        """The exact, atomic final report artifact path for ``step_no``."""
+        return self.db.from_cline / f"step_{step_no:03d}_report.json"
+
+    def check_cline_report_readiness(self) -> dict:
+        """Read-only readiness probe for the current step's Cline report.
+
+        Never mutates the FSM and only ever inspects the exact expected report
+        path (no filesystem scan). Returns a dict with:
+            status:  "WAITING" | "READY" | "INVALID" | "N/A"
+            detail:  short human-readable message
+            path:    expected report path (str) or ""
+            step_no: current step number, or None
+            size:    file size in bytes when present, else None
+            mtime:   file mtime (epoch seconds) when present, else None
+            report:  parsed JSON object when status == "READY", else None
+
+        A file whose size/mtime changes during the read is treated as WAITING
+        ("report still being written") and is never validated. Only the atomic
+        final filename is ever considered; temp/partial artifacts are ignored.
+        """
+        step = self.db.current_step()
+        if not step or step.state != "CLINE_DISPATCHED":
+            return {
+                "status": "N/A",
+                "detail": "no dispatch",
+                "path": "",
+                "step_no": None,
+                "size": None,
+                "mtime": None,
+                "report": None,
+            }
+
+        path = self.expected_cline_report_path(step.step_no)
+        result = {
+            "status": "WAITING",
+            "detail": "report not found",
+            "path": str(path),
+            "step_no": step.step_no,
+            "size": None,
+            "mtime": None,
+            "report": None,
+        }
+        try:
+            stat_before = path.stat()
+        except OSError:
+            return result
+
+        result["size"] = stat_before.st_size
+        result["mtime"] = stat_before.st_mtime
+        if stat_before.st_size > CLINE_REPORT_MAX_BYTES:
+            result["status"] = "INVALID"
+            result["detail"] = "report exceeds size limit"
+            return result
+
+        try:
+            raw = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
+            result["status"] = "INVALID"
+            result["detail"] = f"Cline report unreadable: {exc}"
+            return result
+
+        try:
+            stat_after = path.stat()
+        except OSError:
+            return result
+        if (
+            stat_after.st_size != stat_before.st_size
+            or stat_after.st_mtime_ns != stat_before.st_mtime_ns
+        ):
+            # The file changed while we read it: do not validate a moving
+            # target, re-check on the next polling cycle instead.
+            result["detail"] = "report still being written"
+            result["size"] = stat_after.st_size
+            result["mtime"] = stat_after.st_mtime
+            return result
+
+        result["size"] = stat_after.st_size
+        result["mtime"] = stat_after.st_mtime
+
+        try:
+            report = json.loads(raw)
+        except (ValueError, TypeError):
+            result["status"] = "INVALID"
+            result["detail"] = "JSON parse error"
+            return result
+
+        problems = validate_cline_report(report, step.step_no)
+        if problems:
+            result["status"] = "INVALID"
+            result["detail"] = "; ".join(problems)
+            return result
+
+        result["status"] = "READY"
+        result["detail"] = path.name
+        result["report"] = report
+        return result
+
     def process_cline_report(self) -> dict:
         step = self.db.current_step()
         if not step:
@@ -1973,18 +2169,19 @@ Return JSON conforming exactly to the provided output schema.
         if step.state != "CLINE_DISPATCHED":
             raise RuntimeError(f"Expected CLINE_DISPATCHED, got {step.state}")
 
-        path = self.db.from_cline / f"step_{step.step_no:03d}_report.json"
-        if not path.exists():
-            raise FileNotFoundError(f"Cline report not found: {path}")
+        # The watcher and the FSM share one validator: the button can never be
+        # enabled for a report the FSM would then reject.
+        readiness = self.check_cline_report_readiness()
+        status_kind = readiness["status"]
+        if status_kind == "WAITING":
+            raise FileNotFoundError(
+                f"Cline report not found: {self.expected_cline_report_path(step.step_no)}"
+            )
+        if status_kind != "READY":
+            raise RuntimeError(str(readiness.get("detail") or "Cline report invalid."))
 
-        report = read_json(path)
-        if not isinstance(report, dict):
-            raise RuntimeError("Cline report must be a JSON object.")
-        if int(report.get("step_no", -1)) != step.step_no:
-            raise RuntimeError("Cline report step_no mismatch.")
+        report = readiness["report"]
         status = str(report.get("status", "")).upper()
-        if status not in {"DONE", "REVISE", "BLOCKED", "FAILED"}:
-            raise RuntimeError(f"Invalid Cline report status: {status}")
 
         self.db.save_cline_report(step.step_no, step.attempt, report)
 
@@ -2183,6 +2380,22 @@ class TandemGUI:
         self.codex_var = tk.StringVar(value="Codex: not checked")
         self.footer_var = tk.StringVar(value="Worker_tandem is separate from Mini Worker.")
 
+        # Cline report readiness watcher (Tk-safe polling; detection only).
+        self.cline_report_var = tk.StringVar(value="Cline report: —")
+        self._watcher_after_id: Optional[str] = None
+        self._watcher_target: Optional[tuple[int, str]] = None
+        self._cline_report_status = "N/A"
+        self._cline_report_detail = ""
+        self._cline_report_ready = False
+        self._cline_report_cache: Optional[dict] = None
+        self._cline_report_latest: dict = {
+            "status": "N/A",
+            "detail": "",
+            "step_no": None,
+            "size": None,
+            "mtime": None,
+        }
+
         self._build()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
@@ -2205,6 +2418,7 @@ class TandemGUI:
             self.progress_var,
             self.current_var,
             self.state_var,
+            self.cline_report_var,
             self.codex_var,
         ):
             ttk.Label(info, textvariable=var).pack(anchor="w", pady=1)
@@ -2309,6 +2523,7 @@ class TandemGUI:
         folder = filedialog.askdirectory(title="Select Architecture Assistant project")
         if not folder:
             return
+        self._stop_report_watcher()
         if self.controller:
             self.controller.close()
         try:
@@ -2316,6 +2531,7 @@ class TandemGUI:
             self.project_var.set(str(Path(folder).resolve()))
             self.footer_var.set("Project opened. Mini Worker remains untouched.")
             self.refresh()
+            self._start_report_watcher()
         except Exception as exc:
             self.controller = None
             messagebox.showerror(APP_NAME, str(exc))
@@ -2476,6 +2692,7 @@ class TandemGUI:
             )
             self.footer_var.set("Cline task dispatched.")
             self.refresh()
+            self._start_report_watcher()
         except Exception as exc:
             messagebox.showerror(APP_NAME, str(exc))
 
@@ -2559,6 +2776,8 @@ class TandemGUI:
 
     def refresh(self) -> None:
         if not self.controller:
+            self._refresh_cline_report_status()
+            self._stop_report_watcher()
             self._set_buttons()
             return
 
@@ -2606,6 +2825,8 @@ class TandemGUI:
                 values=(s.step_no, s.state, s.risk, s.title),
             )
 
+        self._refresh_cline_report_status()
+        self._ensure_report_watcher()
         self._set_buttons()
 
     def _set_buttons(self) -> None:
@@ -2625,7 +2846,12 @@ class TandemGUI:
         )
         set_state(self.btn_plan, state == "READY_FOR_CODEX_PLAN")
         set_state(self.btn_dispatch, state == "PLAN_READY")
-        set_state(self.btn_report, state == "CLINE_DISPATCHED")
+        # Processing is only possible once the watcher has validated the exact
+        # expected report for the current step (READY).
+        set_state(
+            self.btn_report,
+            state == "CLINE_DISPATCHED" and self._cline_report_ready,
+        )
         set_state(self.btn_review, state == "CLINE_REPORT_RECEIVED")
         set_state(self.btn_accept, state == "REVIEW_APPROVED")
         set_state(self.btn_repair, state == "REVISE")
@@ -2636,8 +2862,164 @@ class TandemGUI:
             state=("normal" if self.controller and not self.busy else "disabled")
         )
 
+    # ------------------------------------------------------------------ #
+    # Cline report readiness watcher (V1: detection only, no auto-process)
+    # ------------------------------------------------------------------ #
+
+    def _start_report_watcher(self) -> None:
+        self._cancel_report_watcher()
+        if not self.controller:
+            return
+        self._refresh_cline_report_status()
+        self._ensure_report_watcher()
+
+    def _stop_report_watcher(self) -> None:
+        self._cancel_report_watcher()
+        self._watcher_target = None
+
+    def _cancel_report_watcher(self) -> None:
+        if self._watcher_after_id is not None:
+            try:
+                self.root.after_cancel(self._watcher_after_id)
+            except Exception:
+                pass
+            self._watcher_after_id = None
+
+    def _ensure_report_watcher(self) -> None:
+        """Arm the poller iff the current step is CLINE_DISPATCHED, else stop."""
+        if not self.controller:
+            self._stop_report_watcher()
+            return
+        step = self.controller.db.current_step()
+        if not step or step.state != "CLINE_DISPATCHED":
+            self._stop_report_watcher()
+            return
+        if self._watcher_after_id is None:
+            self._schedule_report_watcher()
+
+    def _schedule_report_watcher(self) -> None:
+        if self._watcher_after_id is not None:
+            return
+        self._watcher_after_id = self.root.after(
+            CLINE_REPORT_POLL_MS, self._poll_cline_report
+        )
+
+    def _poll_cline_report(self) -> None:
+        """One lightweight polling cycle; never blocks the Tk thread."""
+        self._watcher_after_id = None
+        try:
+            self._refresh_cline_report_status()
+        finally:
+            # Re-arm only while the same step is still CLINE_DISPATCHED, so the
+            # watcher retargets/stops automatically when the step changes.
+            step = self.controller.db.current_step() if self.controller else None
+            if step and step.state == "CLINE_DISPATCHED":
+                self._schedule_report_watcher()
+
+    @staticmethod
+    def _report_signature(path: Path) -> Optional[tuple[int, int]]:
+        try:
+            st = path.stat()
+        except OSError:
+            return None
+        return (st.st_size, st.st_mtime_ns)
+
+    def _refresh_cline_report_status(self) -> None:
+        """Recompute the report readiness and refresh the GUI status line."""
+        if not self.controller:
+            self._cline_report_cache = None
+            self._apply_readiness(
+                {"status": "N/A", "detail": "", "step_no": None, "size": None, "mtime": None}
+            )
+            return
+
+        step = self.controller.db.current_step()
+        if not step or step.state != "CLINE_DISPATCHED":
+            self._cline_report_cache = None
+            self._watcher_target = None
+            self._apply_readiness(
+                {"status": "N/A", "detail": "", "step_no": None, "size": None, "mtime": None}
+            )
+            return
+
+        target = (step.step_no, step.state)
+        if self._watcher_target != target:
+            # Retargeted to a new step/state: drop any stale signature.
+            self._watcher_target = target
+            self._cline_report_cache = None
+
+        path = self.controller.expected_cline_report_path(step.step_no)
+        signature = self._report_signature(path)
+        cache = self._cline_report_cache
+        if (
+            signature is not None
+            and cache is not None
+            and cache.get("step_no") == step.step_no
+            and cache.get("signature") == signature
+            and cache.get("status") in {"READY", "INVALID"}
+        ):
+            # The exact final file has not changed: reuse the cached result
+            # instead of re-reading/re-parsing/re-validating it every cycle.
+            self._apply_readiness(cache)
+            return
+
+        readiness = dict(self.controller.check_cline_report_readiness())
+        readiness["step_no"] = step.step_no
+        readiness["signature"] = signature
+        if signature is None or readiness.get("status") == "WAITING":
+            # Nothing is cached while the final report is absent or unstable.
+            self._cline_report_cache = None
+        else:
+            self._cline_report_cache = readiness
+        self._apply_readiness(readiness)
+
+    def _apply_readiness(self, readiness: dict) -> None:
+        status = str(readiness.get("status", "N/A"))
+        detail = str(readiness.get("detail", ""))
+        self._cline_report_latest = readiness
+        changed = (status, detail) != (self._cline_report_status, self._cline_report_detail)
+        self._cline_report_status = status
+        self._cline_report_detail = detail
+        self._cline_report_ready = status == "READY"
+        self._update_cline_report_label()
+        if changed:
+            self._set_buttons()
+
+    def _update_cline_report_label(self) -> None:
+        status = self._cline_report_status
+        detail = self._cline_report_detail
+        if status == "READY":
+            suffix = ""
+            size = self._cline_report_latest.get("size")
+            mtime = self._cline_report_latest.get("mtime")
+            if isinstance(size, int):
+                suffix = f" ({size} B"
+                if isinstance(mtime, (int, float)) and mtime:
+                    suffix += f", {datetime.fromtimestamp(mtime).strftime('%H:%M:%S')}"
+                suffix += ")"
+            self.cline_report_var.set(f"Cline report: READY — {detail}{suffix}")
+            self._watcher_set_footer(WATCHER_FOOTER_READY)
+        elif status == "INVALID":
+            self.cline_report_var.set(f"Cline report: INVALID — {detail}")
+            self._watcher_set_footer(WATCHER_FOOTER_INVALID)
+        elif status == "WAITING":
+            self.cline_report_var.set("Cline report: WAITING")
+            self._watcher_set_footer(WATCHER_FOOTER_WAITING)
+        else:
+            self.cline_report_var.set("Cline report: —")
+
+    def _watcher_set_footer(self, text: str) -> None:
+        """Set the footer only while the watcher owns it (never clobbers ops)."""
+        if self.busy:
+            return
+        current = self.footer_var.get()
+        if current and current not in WATCHER_FOOTER_MESSAGES:
+            return
+        self.footer_var.set(text)
+
     def on_close(self) -> None:
         try:
+            self._stop_report_watcher()
             if self.controller:
                 self.controller.close()
         finally:
