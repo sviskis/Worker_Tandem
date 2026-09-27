@@ -38,6 +38,7 @@ import httpx
 import pytest
 
 from supervisor import (
+    DEFAULT_ANTHROPIC_MODEL,
     ID_ANTHROPIC,
     ID_DEEPSEEK,
     ID_OPENAI,
@@ -129,6 +130,7 @@ REVIEW_APPROVE = {
 
 DEEPSEEK_HOST = "api.deepseek.com"
 OPENAI_HOST = "api.openai.com"
+ANTHROPIC_HOST = "api.anthropic.com"
 
 
 # --------------------------------------------------------------------------- #
@@ -296,6 +298,26 @@ def http_timeout(_request: httpx.Request) -> httpx.Response:
     raise httpx.ConnectTimeout("offline timeout")
 
 
+def messages_ok(payload: dict):
+    """The Anthropic Messages envelope: ``content`` is a LIST of typed blocks."""
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "id": "msg_smoke",
+                "type": "message",
+                "role": "assistant",
+                "model": DEFAULT_ANTHROPIC_MODEL,
+                "content": [{"type": "text", "text": json.dumps(payload)}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 5, "output_tokens": 3},
+            },
+        )
+
+    return handler
+
+
 def provider(post):
     """One endpoint: GET -> models, POST -> the scenario's scripted answer."""
 
@@ -308,18 +330,21 @@ def provider(post):
 
 
 class OfflineHttp:
-    """Recording, MockTransport-backed stand-in for both API providers."""
+    """Recording, MockTransport-backed stand-in for the API providers."""
 
-    def __init__(self, *, deepseek=None, openai=None):
+    def __init__(self, *, deepseek=None, openai=None, anthropic=None):
         self.requests: list[httpx.Request] = []
         self.deepseek = deepseek or provider(health_ok)
         self.openai = openai or provider(health_ok)
+        self.anthropic = anthropic or provider(health_ok)
         self._client = httpx.Client(transport=httpx.MockTransport(self._handle))
 
     def _handle(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
         if request.url.host == OPENAI_HOST:
             return self.openai(request)
+        if request.url.host == ANTHROPIC_HOST:
+            return self.anthropic(request)
         return self.deepseek(request)
 
     @property
@@ -794,9 +819,14 @@ def test_scenario_3_high_risk_plan_through_the_controller_uses_openai(guard, pro
     guard.assert_silent()
 
 
-def test_scenario_3_high_risk_review_skips_unregistered_claude(guard, project):
-    """Claude is the declared HIGH/REVIEW preference but has no adapter (M7)."""
-    http = OfflineHttp(deepseek=provider(chat_ok(REVIEW_APPROVE)))
+def test_scenario_3_high_risk_review_runs_through_the_registered_claude(guard, project):
+    """Claude is the declared HIGH/REVIEW preference and is registered (M7.4).
+
+    M7.4 gave ``anthropic`` a buildable adapter, so the declared preference is now
+    the first candidate the router can actually call - the fallback to DeepSeek
+    that M7.1 pinned is gone.
+    """
+    http = OfflineHttp(anthropic=provider(messages_ok(REVIEW_APPROVE)))
     controller = controller_for(project, http, plan_def=PLAN_DEF_HIGH)
     try:
         stub_codex_health(controller)
@@ -806,8 +836,8 @@ def test_scenario_3_high_risk_review_skips_unregistered_claude(guard, project):
         routes = controller.current_routes()
         assert routes["review"]["risk"] == "HIGH"
         assert routes["review"]["primary"] == ID_ANTHROPIC  # declared preference
-        assert ID_ANTHROPIC not in controller.supervisor_router.registered_providers()
-        assert routes["review"]["chain"][1] == ID_DEEPSEEK  # first available
+        assert ID_ANTHROPIC in controller.supervisor_router.registered_providers()
+        assert routes["review"]["chain"][0] == ID_ANTHROPIC
 
         selected_before = len(events(controller, "SUPERVISOR_SELECTED"))
         review = controller.run_supervisor_review()
@@ -817,8 +847,9 @@ def test_scenario_3_high_risk_review_skips_unregistered_claude(guard, project):
         assert [
             e["provider"]
             for e in events(controller, "SUPERVISOR_SELECTED")[selected_before:]
-        ] == [ID_DEEPSEEK]
-        assert http.hosts("POST") == [DEEPSEEK_HOST]
+        ] == [ID_ANTHROPIC]
+        # The Messages endpoint - not /chat/completions - and nothing else.
+        assert http.hosts("POST") == [ANTHROPIC_HOST]
         assert events(controller, "SUPERVISOR_RESULT")[-1]["route_chain"][0] == (
             ID_ANTHROPIC
         )
@@ -1371,6 +1402,486 @@ def test_offline_matrix_summary(guard, project):
         assert guard.codex_calls == 0
         assert http.requests, "the offline transport must have been exercised"
         assert isinstance(http._client._transport, httpx.MockTransport)
+    finally:
+        http.close()
+        controller.db.close()
+
+    assert repo_runtime_snapshot() == repo_before
+    guard.assert_silent()
+
+
+# --------------------------------------------------------------------------- #
+# M7.5 FINAL OFFLINE VERIFICATION - all FOUR providers, no live traffic
+#
+#   codex_legacy + deepseek + openai + anthropic
+#
+# Scenarios A-G below run the same LiveCallGuard as the rest of this file, so
+# LIVE_NETWORK_CALLS / CODEX_CALLS / SECRET_LEAKS are asserted, not hoped for.
+# --------------------------------------------------------------------------- #
+
+
+def messages_error(status: int, error_type: str, message: str = "offline error"):
+    """Anthropic error envelope (``authentication_error`` etc.)."""
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            status,
+            json={"type": "error", "error": {"type": error_type, "message": message}},
+        )
+
+    return handler
+
+
+def review_policy(*candidates: str) -> SupervisorPolicy:
+    """An AUTO policy whose REVIEW chain is exactly ``candidates``."""
+    routes = {
+        risk: {
+            "PLAN": (candidates[0],),
+            "REVIEW": tuple(candidates),
+        }
+        for risk in ("LOW", "MEDIUM", "HIGH")
+    }
+    return SupervisorPolicy(
+        mode="AUTO",
+        risk_routes=routes,
+        fallback_chain=(),
+        max_provider_retries=0,
+        allow_codex_legacy=False,
+    )
+
+
+def db_count(controller, table: str) -> int:
+    return controller.db.db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+
+
+def dispatch_count(controller) -> int:
+    """How often Cline was dispatched (a rerun would add one)."""
+    return controller.db.db.execute(
+        "SELECT COUNT(*) FROM events WHERE event_type LIKE '%->CLINE_DISPATCHED'"
+    ).fetchone()[0]
+
+
+def test_m75_scenario_a_manual_anthropic_plan_is_valid_and_never_falls_back(
+    guard, project
+):
+    """A: MANUAL Anthropic PLAN -> valid canonical PLAN, no fallback."""
+    http = OfflineHttp(anthropic=provider(messages_ok(PLAN_OK)))
+    controller = controller_for(
+        project, http, policy=manual_policy(), plan_def=PLAN_DEF_MEDIUM
+    )
+    try:
+        stub_codex_health(controller)
+        assert controller.supervisor_router.registered_providers() == (
+            PROVIDER_CODEX_LEGACY,
+            ID_ANTHROPIC,
+        )
+
+        plan = controller.run_codex_plan()
+
+        # A valid, canonical PLAN - exactly the fixture, no provider extras.
+        assert plan["decision"] == "PLAN_READY"
+        assert plan["goal"] == PLAN_OK["goal"]
+        assert set(plan) >= set(PLAN_OK)
+        assert "step_no" not in plan or plan["step_no"] == 1  # controller identity
+
+        # Claude did it, on the Messages endpoint, and nothing else was called.
+        assert controller.supervisor_router.calls[-1]["provider"] == ID_ANTHROPIC
+        assert events(controller, "SUPERVISOR_FALLBACK") == []
+        assert [e["provider"] for e in events(controller, "SUPERVISOR_SELECTED")] == [
+            ID_ANTHROPIC
+        ]
+        assert http.hosts("POST") == [ANTHROPIC_HOST]
+        assert http.authorization(ANTHROPIC_HOST) == [""]  # x-api-key, not bearer
+    finally:
+        http.close()
+        controller.db.close()
+    guard.assert_silent()
+
+
+def test_m75_scenario_b_manual_anthropic_review_approves_and_keeps_the_report(
+    guard, project
+):
+    """B: MANUAL Anthropic REVIEW -> APPROVE, report preserved, attempt unchanged."""
+    http = OfflineHttp(anthropic=provider(messages_ok(REVIEW_APPROVE)))
+    controller = controller_for(project, http)
+    try:
+        stub_codex_health(controller)
+        prepare_accepted_report(controller)  # Codex PLAN + accepted Cline report
+        controller.save_supervisor_policy(manual_policy())
+
+        step = controller.db.get_step(1)
+        attempt_before = step.attempt
+        report_before = controller.db.cline_report_for_attempt(1, attempt_before)
+        plans_before = db_count(controller, "codex_plans")
+        dispatches_before = dispatch_count(controller)
+        increments = spy_on(controller, "increment_attempt")
+
+        review = controller.run_supervisor_review()
+
+        assert review["verdict"] == "APPROVE"
+        assert controller.db.get_step(1).state == "REVIEW_APPROVED"
+        assert events(controller, "SUPERVISOR_FALLBACK") == []
+        assert [e["provider"] for e in events(controller, "SUPERVISOR_SELECTED")[-1:]] == [
+            ID_ANTHROPIC
+        ]
+        assert http.hosts("POST") == [ANTHROPIC_HOST]
+
+        # Nothing consumed, nothing lost, nothing re-run.
+        step_after = controller.db.get_step(1)
+        assert step_after.attempt == attempt_before == 1
+        assert increments == []
+        assert controller.db.cline_report_for_attempt(1, attempt_before) == report_before
+        assert db_count(controller, "codex_plans") == plans_before
+        assert dispatch_count(controller) == dispatches_before
+        assert controller.db.has_codex_review(1, attempt_before) is True
+    finally:
+        http.close()
+        controller.db.close()
+    guard.assert_silent()
+
+
+def test_m75_scenario_c_auto_review_falls_back_from_openai_to_anthropic(guard, project):
+    """C: OpenAI temporary failure -> Anthropic -> APPROVE."""
+    http = OfflineHttp(
+        openai=provider(http_error(429, "rate limited", "rate_limit")),
+        anthropic=provider(messages_ok(REVIEW_APPROVE)),
+    )
+    controller = controller_for(project, http)
+    try:
+        stub_codex_health(controller)
+        prepare_accepted_report(controller)
+        controller.save_supervisor_policy(review_policy(ID_OPENAI, ID_ANTHROPIC))
+
+        step = controller.db.get_step(1)
+        attempt_before = step.attempt
+        report_before = controller.db.cline_report_for_attempt(1, attempt_before)
+
+        review = controller.run_supervisor_review()
+
+        assert review["verdict"] == "APPROVE"
+        assert controller.db.get_step(1).state == "REVIEW_APPROVED"
+
+        hops = events(controller, "SUPERVISOR_FALLBACK")
+        assert [h["fallback_from"] for h in hops] == [ID_OPENAI]
+        assert [h["fallback_to"] for h in hops] == [ID_ANTHROPIC]
+        assert events(controller, "SUPERVISOR_RESULT")[-1]["provider"] == ID_ANTHROPIC
+
+        # One POST per provider: exactly one fallback, no retry storm, no loop.
+        assert http.hosts("POST") == [OPENAI_HOST, ANTHROPIC_HOST]
+        assert controller.db.get_step(1).attempt == attempt_before
+        assert controller.db.cline_report_for_attempt(1, attempt_before) == report_before
+    finally:
+        http.close()
+        controller.db.close()
+    guard.assert_silent()
+
+
+def test_m75_scenario_d_anthropic_temporary_failure_follows_the_policy(guard, project):
+    """D: Anthropic temporary failure -> the router falls back per policy."""
+    http = OfflineHttp(
+        anthropic=provider(messages_error(500, "api_error", "claude exploded")),
+        openai=provider(chat_ok(REVIEW_APPROVE)),
+    )
+    controller = controller_for(project, http)
+    try:
+        stub_codex_health(controller)
+        prepare_accepted_report(controller)
+        # Policy: Claude first, OpenAI next, no same-provider retry.
+        controller.save_supervisor_policy(review_policy(ID_ANTHROPIC, ID_OPENAI))
+
+        attempt_before = controller.db.get_step(1).attempt
+        review = controller.run_supervisor_review()
+
+        assert review["verdict"] == "APPROVE"
+        hops = events(controller, "SUPERVISOR_FALLBACK")
+        assert [h["fallback_from"] for h in hops] == [ID_ANTHROPIC]
+        assert [h["fallback_to"] for h in hops] == [ID_OPENAI]
+        assert events(controller, "SUPERVISOR_RESULT")[-1]["provider"] == ID_OPENAI
+
+        assert http.hosts("POST") == [ANTHROPIC_HOST, OPENAI_HOST]
+        assert controller.db.get_step(1).attempt == attempt_before
+        assert controller.db.get_step(1).state == "REVIEW_APPROVED"
+
+        # A policy that lists Claude ONLY keeps it Claude-only: even though a
+        # healthy OpenAI is registered, a temporary Claude failure defers instead
+        # of hopping (proved on a fresh step).
+        strict_root = project / "strict"
+        strict_root.mkdir()
+        strict_http = OfflineHttp(
+            anthropic=provider(messages_error(503, "overloaded_error")),
+            openai=provider(chat_ok(REVIEW_APPROVE)),
+        )
+        strict_controller = controller_for(strict_root, strict_http)
+        try:
+            stub_codex_health(strict_controller)
+            prepare_accepted_report(strict_controller)
+            strict_controller.save_supervisor_policy(review_policy(ID_ANTHROPIC))
+
+            strict = strict_controller.run_supervisor_review()
+
+            assert strict["deferred"] is True
+            assert strict["retryable"] is True
+            assert strict["provider"] == ID_ANTHROPIC
+            assert strict["state"] == "CODEX_REVIEW_RETRYABLE"
+            assert events(strict_controller, "SUPERVISOR_FALLBACK") == []
+            assert strict_http.hosts("POST") == [ANTHROPIC_HOST]
+            assert strict_controller.db.get_step(1).attempt == 1
+        finally:
+            strict_http.close()
+            strict_controller.db.close()
+    finally:
+        http.close()
+        controller.db.close()
+    guard.assert_silent()
+
+
+def test_m75_scenario_e_anthropic_auth_failure_never_retries_or_falls_back(
+    guard, project
+):
+    """E: Anthropic auth failure -> no automatic retry/fallback when forbidden."""
+    http = OfflineHttp(
+        anthropic=provider(
+            messages_error(401, "authentication_error", "invalid x-api-key")
+        ),
+        openai=provider(chat_ok(REVIEW_APPROVE)),
+        deepseek=provider(chat_ok(REVIEW_APPROVE)),
+    )
+    controller = controller_for(project, http)
+    try:
+        stub_codex_health(controller)
+        prepare_accepted_report(controller)
+        # MANUAL Claude for REVIEW, fallback forbidden, zero provider retries.
+        controller.save_supervisor_policy(
+            manual_policy(
+                plan_provider=PROVIDER_CODEX_LEGACY, review_provider=ID_ANTHROPIC
+            )
+        )
+        selected_before = len(events(controller, "SUPERVISOR_SELECTED"))
+        attempt_before = controller.db.get_step(1).attempt
+        report_before = controller.db.cline_report_for_attempt(1, attempt_before)
+
+        with pytest.raises(SupervisorRunError) as info:
+            controller.run_supervisor_review()
+
+        assert info.value.category == "auth"
+        assert info.value.retryable is False
+
+        # One attempt on Claude only: no same-provider retry, no chain walk.
+        assert http.hosts("POST") == [ANTHROPIC_HOST]
+        assert (
+            len(events(controller, "SUPERVISOR_SELECTED")) - selected_before == 1
+        )
+        assert events(controller, "SUPERVISOR_FALLBACK") == []
+
+        # Nothing consumed, nothing lost.
+        assert controller.db.get_step(1).attempt == attempt_before == 1
+        assert controller.db.cline_report_for_attempt(1, attempt_before) == report_before
+        assert controller.db.has_codex_review(1, attempt_before) is False
+    finally:
+        http.close()
+        controller.db.close()
+    guard.assert_silent()
+
+
+def test_m75_scenario_f_synthetic_anthropic_key_never_leaks(guard, project):
+    """F: the synthetic ANTHROPIC_API_KEY never reaches a file, log or widget."""
+    secret = SECRETS["ANTHROPIC_API_KEY"]
+
+    def echoing_error(_request: httpx.Request) -> httpx.Response:
+        """A hostile provider: it echoes the credential back in its error body."""
+        return httpx.Response(
+            401,
+            json={
+                "type": "error",
+                "error": {
+                    "type": "authentication_error",
+                    "message": f"invalid x-api-key: {secret}",
+                },
+            },
+        )
+
+    http = OfflineHttp(
+        anthropic=provider(echoing_error),
+        openai=provider(chat_ok(REVIEW_APPROVE)),
+    )
+    controller = controller_for(project, http)
+    try:
+        stub_codex_health(controller)
+        prepare_accepted_report(controller)
+        controller.save_supervisor_policy(
+            manual_policy(
+                plan_provider=PROVIDER_CODEX_LEGACY, review_provider=ID_ANTHROPIC
+            )
+        )
+        status = controller.provider_status()
+
+        with pytest.raises(SupervisorRunError) as info:
+            controller.run_supervisor_review()
+
+        # The key really was used as the credential on the one POST ...
+        posts = [r for r in http.requests if r.method == "POST"]
+        assert [r.headers.get("x-api-key", "") for r in posts] == [secret]
+
+        # ... and it is nowhere else: not in the failure, telemetry, health, the
+        # audit rows, the policy file, nor anywhere in the project runtime.
+        assert_no_secrets(
+            str(info.value),
+            info.value.sanitized_message,
+            events(controller, "SUPERVISOR_SELECTED"),
+            events(controller, "SUPERVISOR_RESULT"),
+            events(controller, "SUPERVISOR_ALL_FAILED"),
+            status,
+            controller.supervisor_router.route_history,
+            controller.supervisor_router.calls,
+            policy_file_text(controller),
+        )
+        assert tree_secret_hits(controller.db.project_root) == []
+        assert tree_secret_hits(project) == []
+    finally:
+        http.close()
+        controller.db.close()
+    guard.assert_silent()
+
+
+def test_m75_scenario_g_forbidden_paths_are_hard_blocks(guard, project):
+    """G: socket / real httpx / Codex subprocess / shell are HARD failures.
+
+    This test deliberately trips every trap, so it must NOT call
+    ``guard.assert_silent()`` - it asserts the counters instead, which proves the
+    traps fire rather than merely counting.
+    """
+    # 1) socket.create_connection - nothing may leave the process.
+    with pytest.raises(AssertionError, match="socket.create_connection"):
+        socket.create_connection(("api.anthropic.com", 443), timeout=1)
+    assert guard.counts["socket.create_connection"] == 1
+
+    # 2) the REAL httpx network transport (httpx.MockTransport stays allowed).
+    with pytest.raises(Exception):
+        httpx.Client(timeout=1).post(
+            "https://api.anthropic.com/v1/messages",
+            json={"model": "claude", "max_tokens": 1, "messages": []},
+        )
+    assert guard.counts["httpx.HTTPTransport.handle_request"] == 1
+
+    # 3) the Codex CLI: resolution AND process spawn (plus a list-form command).
+    with pytest.raises(AssertionError, match="CODEX CLI RESOLUTION"):
+        shutil.which("codex")
+    with pytest.raises(AssertionError, match="CODEX PROCESS EXECUTED"):
+        subprocess.run(["codex", "--version"], check=False)
+    with pytest.raises(AssertionError, match="CODEX PROCESS SPAWNED"):
+        subprocess.Popen(["codex", "exec"])
+    assert guard.counts["codex_which"] == 1
+    assert guard.counts["codex_process"] == 2
+    assert guard.codex_calls == 3
+
+    # 4) no shell escape either.
+    with pytest.raises(AssertionError, match="os.system"):
+        os.system("codex --version")
+    assert guard.counts["os.system"] == 1
+
+    # 5) ... while the OFFLINE transport keeps working: only the real network is
+    #    forbidden, which is exactly what makes the smoke suite meaningful.
+    http = OfflineHttp(anthropic=provider(messages_ok(PLAN_OK)))
+    try:
+        assert isinstance(http._client._transport, httpx.MockTransport)
+        assert http._client.get("https://api.anthropic.com/v1/models").status_code == 200
+    finally:
+        http.close()
+
+
+def four_provider_endpoint(request: httpx.Request) -> httpx.Response:
+    """GET -> models; POST -> PLAN/REVIEW in the caller's provider dialect."""
+    if request.method == "GET":
+        return health_ok(request)
+    text = request.content.decode("utf-8")
+    payload = REVIEW_APPROVE if "verdict" in text else PLAN_OK
+    if "/messages" in request.url.path:  # Anthropic Messages API
+        return messages_ok(payload)(request)
+    return chat_ok(payload)(request)
+
+
+def test_m75_final_offline_summary_all_four_providers(guard, project):
+    """The M7.5 counters: LIVE_NETWORK_CALLS / CODEX_CALLS / SECRET_LEAKS = 0."""
+    repo_before = repo_runtime_snapshot()
+    http = OfflineHttp(
+        deepseek=four_provider_endpoint,
+        openai=four_provider_endpoint,
+        anthropic=four_provider_endpoint,
+    )
+    controller = controller_for(project, http, plan_def=PLAN_DEF_MEDIUM)
+    try:
+        stub_codex_health(controller)
+
+        # 1) codex_legacy PLAN under the M4 default policy: nothing but the stub.
+        assert controller.supervisor_router.registered_providers() == (
+            PROVIDER_CODEX_LEGACY,
+        )
+        stub_runner(controller, PLAN_OK)
+        plan = controller.run_codex_plan()
+        assert plan["decision"] == "PLAN_READY"
+        assert controller.supervisor_router.calls[-1]["provider"] == (
+            PROVIDER_CODEX_LEGACY
+        )
+
+        # 2) AUTO registers all four; MANUAL Claude then performs the REVIEW.
+        controller.save_supervisor_policy(default_auto_policy())
+        assert set(controller.supervisor_router.registered_providers()) == {
+            PROVIDER_CODEX_LEGACY,
+            ID_DEEPSEEK,
+            ID_OPENAI,
+            ID_ANTHROPIC,
+        }
+
+        controller.approve_plan_and_dispatch_cline(reason="m7.5")
+        wt.write_json_atomic(controller.expected_cline_report_path(1), report_ok())
+        controller.process_cline_report()
+        controller.save_supervisor_policy(
+            manual_policy(
+                plan_provider=PROVIDER_CODEX_LEGACY, review_provider=ID_ANTHROPIC
+            )
+        )
+        review = controller.run_supervisor_review()
+        assert review["verdict"] == "APPROVE"
+        assert controller.db.get_step(1).state == "REVIEW_APPROVED"
+
+        # 3) Health of all four: three HTTP probes (MockTransport) + the stub CLI.
+        status = controller.provider_status()
+        assert status[ID_DEEPSEEK]["status"] == "READY"
+        assert status[ID_OPENAI]["status"] == "READY"
+        assert status[ID_ANTHROPIC]["status"] == "READY"
+        assert status[PROVIDER_CODEX_LEGACY]["status"] == "READY"
+
+        # 4) The three M7.5 counters.
+        assert ANTHROPIC_HOST in http.hosts("POST")
+        assert_no_secrets(
+            plan,
+            review,
+            status,
+            events(controller, "SUPERVISOR_SELECTED"),
+            events(controller, "SUPERVISOR_RESULT"),
+            controller.supervisor_router.route_history,
+            controller.supervisor_router.calls,
+        )
+        counters = {
+            "LIVE_NETWORK_CALLS": sum(guard.counts[name] for name in guard.ABSOLUTE),
+            "CODEX_CALLS": guard.codex_calls,
+            "SECRET_LEAKS": len(tree_secret_hits(controller.db.project_root))
+            + len(tree_secret_hits(project)),
+        }
+        assert isinstance(http._client._transport, httpx.MockTransport)
+        assert http.requests, "the offline transport must have been exercised"
+        assert counters == {
+            "LIVE_NETWORK_CALLS": 0,
+            "CODEX_CALLS": 0,
+            "SECRET_LEAKS": 0,
+        }, counters
+        print(
+            "M7.5 SUMMARY: "
+            f"LIVE_NETWORK_CALLS={counters['LIVE_NETWORK_CALLS']} "
+            f"CODEX_CALLS={counters['CODEX_CALLS']} "
+            f"SECRET_LEAKS={counters['SECRET_LEAKS']} "
+            f"POST hosts={http.hosts('POST')}"
+        )
     finally:
         http.close()
         controller.db.close()

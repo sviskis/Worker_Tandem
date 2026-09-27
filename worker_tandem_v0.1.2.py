@@ -46,9 +46,11 @@ from tkinter import filedialog, messagebox, ttk
 from typing import Any, Mapping, Optional
 
 from supervisor import (
+    ANTHROPIC_API_KEY_ENV,
     BUDGET_CHEAP,
     BUDGET_PREMIUM,
     BUDGET_STANDARD,
+    DEFAULT_ANTHROPIC_MODEL,
     DEFAULT_DEEPSEEK_MODEL,
     DEFAULT_OPENAI_MODEL,
     DEEPSEEK_API_KEY_ENV,
@@ -61,9 +63,11 @@ from supervisor import (
     PLAN_OPERATION,
     POLICY_MODE_AUTO,
     POLICY_MODE_MANUAL,
+    PROVIDER_ANTHROPIC,
     PROVIDER_CODEX_LEGACY,
     REVIEW_OPERATION,
     VALIDATION_RUNNER,
+    AnthropicSupervisorAdapter,
     DeepSeekSupervisorAdapter,
     HttpTransport,
     LegacyCodexSupervisorAdapter,
@@ -74,6 +78,7 @@ from supervisor import (
     SupervisorReviewRequest,
     SupervisorRouter,
     SupervisorRunError,
+    default_anthropic_config,
     default_auto_policy,
     default_deepseek_config,
     default_openai_config,
@@ -2926,9 +2931,9 @@ SUPERVISOR_BUDGET_CHOICES = (BUDGET_CHEAP, BUDGET_STANDARD, BUDGET_PREMIUM)
 #: legacy CodexRunner configuration (M4 contract).
 SUPERVISOR_MODEL_PROVIDERS = (ID_DEEPSEEK, ID_OPENAI, ID_ANTHROPIC)
 
-#: Reserved for the future Anthropic adapter (M7); the env name follows the
-#: shared ``env:NAME`` convention so a saved policy stays valid afterwards.
-ANTHROPIC_API_KEY_ENV = "ANTHROPIC_API_KEY"
+#: The Claude key env name now comes from ``supervisor.anthropic_adapter``
+#: (single source of truth, M7.4). The ``env:NAME`` convention is unchanged, so
+#: policies saved before M7.4 stay valid.
 
 #: Env var shown per provider. Only the NAME is ever resolved for display.
 SUPERVISOR_KEY_ENV_NAMES = {
@@ -2942,9 +2947,16 @@ SUPERVISOR_ENV_PROVIDER = {
     env_name: provider_id for provider_id, env_name in SUPERVISOR_KEY_ENV_NAMES.items()
 }
 
-#: Providers with a buildable adapter today. ``anthropic``/Claude is listed in
-#: the GUI but has no adapter before M7 and is therefore never registered.
-SUPERVISOR_BUILDABLE_PROVIDERS = (ID_DEEPSEEK, ID_OPENAI, PROVIDER_CODEX_LEGACY)
+#: Providers with a buildable adapter today. M7.4 registered ``anthropic``
+#: (Claude), so MANUAL selection, the AUTO route and fallback targets/sources can
+#: all use it. Registration never changes the DEFAULT provider: with no saved
+#: policy the controller still builds a MANUAL/codex_legacy router.
+SUPERVISOR_BUILDABLE_PROVIDERS = (
+    ID_DEEPSEEK,
+    ID_OPENAI,
+    ID_ANTHROPIC,
+    PROVIDER_CODEX_LEGACY,
+)
 
 
 def supervisor_label(provider_id: str) -> str:
@@ -2964,7 +2976,7 @@ def supervisor_model_defaults() -> dict[str, str]:
     return {
         ID_DEEPSEEK: DEFAULT_DEEPSEEK_MODEL,
         ID_OPENAI: DEFAULT_OPENAI_MODEL,
-        ID_ANTHROPIC: "",
+        ID_ANTHROPIC: DEFAULT_ANTHROPIC_MODEL,
     }
 
 
@@ -3028,7 +3040,13 @@ def build_supervisor_provider(
             model=chosen.get(ID_OPENAI) or DEFAULT_OPENAI_MODEL
         )
         return OpenAISupervisorAdapter(config, transport, env=env)
-    # "Claude" (ID_ANTHROPIC) has no adapter before M7.
+    if provider_id == ID_ANTHROPIC:
+        # M7.4: Claude is a first-class provider (Messages API, model/api_base/
+        # timeout configurable; the key is read at call time and never stored).
+        config = default_anthropic_config(
+            model=chosen.get(ID_ANTHROPIC) or DEFAULT_ANTHROPIC_MODEL
+        )
+        return AnthropicSupervisorAdapter(config, transport, env=env)
     return None
 
 
@@ -3315,7 +3333,7 @@ class TandemController:
             }
             if not self.supervisor_provider_available(provider_id):
                 entry["status"] = "UNAVAILABLE"
-                entry["detail"] = "no adapter yet (Claude lands with M7)"
+                entry["detail"] = "no adapter for this provider id"
                 status[provider_id] = entry
                 continue
             adapter = self.supervisor_provider(provider_id)

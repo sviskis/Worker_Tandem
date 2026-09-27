@@ -36,10 +36,12 @@ import pytest
 
 from supervisor import (
     DEFAULT_LEGACY_PROVIDER,
+    HEALTH_KEY_MISSING,
     ID_ANTHROPIC,
     ID_DEEPSEEK,
     ID_OPENAI,
     PROVIDER_CODEX_LEGACY,
+    AnthropicSupervisorAdapter,
     FakeHttpResponse,
     FakeHttpTransport,
     SupervisorRunError,
@@ -337,12 +339,15 @@ def test_provider_status_labels_cover_the_spec_states():
     assert wt.supervisor_provider_status_label("") == "NOT CHECKED"
 
 
-def test_claude_is_listed_but_has_no_adapter_yet():
+def test_claude_is_listed_and_is_a_buildable_provider():
     available = wt.TandemController.supervisor_provider_available
-    assert available(ID_ANTHROPIC) is False
+    assert available(ID_ANTHROPIC) is True
     assert available(ID_DEEPSEEK) is True
     assert available(PROVIDER_CODEX_LEGACY) is True
-    assert wt.build_supervisor_provider(ID_ANTHROPIC, transport=ready_transport()) is None
+    built = wt.build_supervisor_provider(ID_ANTHROPIC, transport=ready_transport())
+    assert isinstance(built, AnthropicSupervisorAdapter)
+    assert built.provider_id == ID_ANTHROPIC
+    assert built.model == wt.supervisor_model_defaults()[ID_ANTHROPIC]
 
 
 # --------------------------------------------------------------------------- #
@@ -447,11 +452,12 @@ def test_policy_round_trips_through_a_new_controller(tmp_path):
         assert policy.plan_provider == ID_DEEPSEEK
         assert policy.review_provider == ID_ANTHROPIC
         assert policy.budget_mode == "CHEAP"
-        # Claude has no adapter yet, so it stays in the policy (the router skips
-        # unregistered candidates) but is never registered.
+        # M7.4 registered Claude, so a MANUAL policy that selects it for REVIEW
+        # really does register it (loading a policy never calls a provider).
         assert reopened.supervisor_router.registered_providers() == (
             PROVIDER_CODEX_LEGACY,
             ID_DEEPSEEK,
+            ID_ANTHROPIC,
         )
     finally:
         reopened.db.close()
@@ -476,6 +482,7 @@ def test_auto_policy_round_trips_through_a_new_controller(tmp_path):
             PROVIDER_CODEX_LEGACY,
             ID_DEEPSEEK,
             ID_OPENAI,
+            ID_ANTHROPIC,
         )
     finally:
         reopened.db.close()
@@ -523,7 +530,7 @@ def test_policy_file_never_contains_a_secret(tmp_path):
         assert stored["models"] == {
             ID_DEEPSEEK: "deepseek-chat",
             ID_OPENAI: "gpt-4o-mini",
-            ID_ANTHROPIC: "",
+            ID_ANTHROPIC: wt.DEFAULT_ANTHROPIC_MODEL,
         }
         assert stored["enabled_providers"]
     finally:
@@ -632,7 +639,12 @@ def test_provider_status_reports_an_error_and_keeps_going(tmp_path):
         assert status[ID_DEEPSEEK]["status"].startswith("ERROR")
         # A failing provider never aborts the check of the others.
         assert status[PROVIDER_CODEX_LEGACY]["status"] == "READY"
-        assert status[ID_ANTHROPIC]["status"] == "UNAVAILABLE"
+        # Claude is buildable now (M7.4): no key in this env, so the probe
+        # reports the missing key instead of "no adapter".
+        assert status[ID_ANTHROPIC]["status"] == wt.supervisor_provider_status_label(
+            HEALTH_KEY_MISSING
+        )
+        assert status[ID_ANTHROPIC]["status"] == "KEY MISSING"
     finally:
         controller.db.close()
 
@@ -818,6 +830,7 @@ def test_gui_auto_selection_seeds_the_auto_policy(gui):
         PROVIDER_CODEX_LEGACY,
         ID_DEEPSEEK,
         ID_OPENAI,
+        ID_ANTHROPIC,
     )
     assert app.supervisor_mode_var.get() == "AUTO"
 
@@ -833,10 +846,11 @@ def test_gui_review_choice_maps_the_claude_label_to_the_anthropic_id(gui):
     stored = read_policy(controller)
     assert stored["review_provider"] == ID_ANTHROPIC
     assert controller.supervisor_policy.review_provider == ID_ANTHROPIC
-    # Claude has no adapter before M7: it is never registered, so nothing
-    # silently pretends to support it.
+    # M7.4: Claude has an adapter, so the MANUAL selection is registered next to
+    # the controller's own Codex Legacy runner.
     assert controller.supervisor_router.registered_providers() == (
         PROVIDER_CODEX_LEGACY,
+        ID_ANTHROPIC,
     )
 
 
@@ -912,7 +926,7 @@ def test_gui_check_providers_runs_off_the_tk_thread(gui):
     assert app.provider_status_vars[PROVIDER_CODEX_LEGACY].get() == (
         "Codex Legacy: READY"
     )
-    assert app.provider_status_vars[ID_ANTHROPIC].get() == "Claude: UNAVAILABLE"
+    assert app.provider_status_vars[ID_ANTHROPIC].get() == "Claude: KEY MISSING"
     assert "SUPERVISOR PROVIDERS" in app.details.get("1.0", "end")
     assert "no completion" in app.footer_var.get()
 

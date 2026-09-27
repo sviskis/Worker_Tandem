@@ -289,7 +289,8 @@ def test_router_provider_ids_match_the_adapters():
     assert ID_DEEPSEEK == PROVIDER_DEEPSEEK
     assert ID_OPENAI == PROVIDER_OPENAI
     assert DEFAULT_LEGACY_PROVIDER == PROVIDER_CODEX_LEGACY
-    # Anthropic has no adapter yet (M7); the policy id is still reserved.
+    # Anthropic (M7) is the declared HIGH/REVIEW preference and - since M7.4 -
+    # a registered provider; this test uses a fake to stay at the router level.
     assert ID_ANTHROPIC == "anthropic"
 
 
