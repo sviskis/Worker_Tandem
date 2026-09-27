@@ -250,6 +250,8 @@ def test_plan_wrong_model_step_no_is_ignored(ctrl):
 
 def test_review_missing_model_step_no_is_accepted(ctrl):
     advance_to(ctrl, "CLINE_REPORT_RECEIVED")
+    # An accepted Cline report for the current attempt is a review precondition.
+    ctrl.db.save_cline_report(1, 0, {"step_no": 1, "status": "DONE", "summary": "x"})
     ctrl.context_builder.review_context = lambda step: {"step_no": step.step_no}
     stub_run_structured(ctrl, REVIEW_OK)  # no step_no
 
@@ -264,6 +266,8 @@ def test_review_missing_model_step_no_is_accepted(ctrl):
 
 def test_review_wrong_model_step_no_is_ignored(ctrl):
     advance_to(ctrl, "CLINE_REPORT_RECEIVED")
+    # An accepted Cline report for the current attempt is a review precondition.
+    ctrl.db.save_cline_report(1, 0, {"step_no": 1, "status": "DONE", "summary": "x"})
     ctrl.context_builder.review_context = lambda step: {"step_no": step.step_no}
     stub_run_structured(ctrl, {**REVIEW_OK, "step_no": 999})
 
@@ -305,7 +309,14 @@ EXPECTED_ALLOWED_TRANSITIONS = {
     "WAITING_HUMAN_APPROVAL": {"CLINE_DISPATCHED", "BLOCKED", "ABORTED"},
     "CLINE_DISPATCHED": {"CLINE_REPORT_RECEIVED", "BLOCKED", "FAILED"},
     "CLINE_REPORT_RECEIVED": {"CODEX_REVIEW_RUNNING", "BLOCKED", "FAILED"},
-    "CODEX_REVIEW_RUNNING": {"REVIEW_APPROVED", "REVISE", "BLOCKED", "FAILED"},
+    "CODEX_REVIEW_RUNNING": {
+        "REVIEW_APPROVED",
+        "REVISE",
+        "BLOCKED",
+        "CODEX_REVIEW_RETRYABLE",
+        "FAILED",
+    },
+    "CODEX_REVIEW_RETRYABLE": {"CODEX_REVIEW_RUNNING", "BLOCKED", "ABORTED"},
     "REVIEW_APPROVED": {"VERIFIED", "BLOCKED", "ABORTED"},
     "REVISE": {"CLINE_DISPATCHED", "BLOCKED", "ABORTED"},
     "BLOCKED": {"READY_FOR_CODEX_PLAN", "ABORTED"},

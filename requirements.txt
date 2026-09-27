@@ -1,0 +1,6 @@
+# Worker Tandem runtime dependencies.
+#
+# This is the project's single dependency declaration (no pyproject/setup.py
+# exists). The supervisor package uses httpx as its ONLY third-party
+# dependency; there are deliberately no official OpenAI/Anthropic SDKs.
+httpx>=0.27,<1
