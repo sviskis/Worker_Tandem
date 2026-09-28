@@ -314,6 +314,9 @@ EXPECTED_ALLOWED_TRANSITIONS = {
         "REVISE",
         "BLOCKED",
         "CODEX_REVIEW_RETRYABLE",
+        # The one explicit recovery edge (interrupted REVIEW). It is reachable
+        # only through TandemController.recover_review_running_to_received.
+        "CLINE_REPORT_RECEIVED",
         "FAILED",
     },
     "CODEX_REVIEW_RETRYABLE": {"CODEX_REVIEW_RUNNING", "BLOCKED", "ABORTED"},
@@ -338,6 +341,16 @@ def test_fsm_valid_and_terminal_states_are_unchanged():
 
 def test_recovery_transition_failed_to_ready_is_legal():
     assert "READY_FOR_CODEX_PLAN" in wt.ALLOWED_TRANSITIONS["FAILED"]
+
+
+def test_recovery_transition_review_running_to_received_is_legal():
+    """The ONE interrupted-REVIEW recovery edge is an explicit FSM transition."""
+    assert "CLINE_REPORT_RECEIVED" in wt.ALLOWED_TRANSITIONS["CODEX_REVIEW_RUNNING"]
+    # ... and it is not a generic "go back" door: only the normal dispatch and
+    # the interrupted-REVIEW recovery may ever enter CLINE_REPORT_RECEIVED.
+    for state, targets in wt.ALLOWED_TRANSITIONS.items():
+        if "CLINE_REPORT_RECEIVED" in targets:
+            assert state in {"CLINE_DISPATCHED", "CODEX_REVIEW_RUNNING"}, state
 
 
 def test_illegal_transition_is_rejected(ctrl):

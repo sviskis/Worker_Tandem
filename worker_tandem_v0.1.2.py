@@ -197,6 +197,17 @@ CODEX_REVIEW_RETRYABLE_EVENT = "CODEX_REVIEW_RETRYABLE"
 CODEX_REVIEW_RETRY_EVENT = "CODEX_REVIEW_RETRY"
 RECOVERY_REVIEW_RETRY_EVENT = "RECOVERY_REVIEW_RETRY"
 
+#: Explicit, audited recovery of a REVIEW that was INTERRUPTED while running
+#: (crash/restart between ``CLINE_REPORT_RECEIVED -> CODEX_REVIEW_RUNNING`` and
+#: the persisted review). One-time, human-triggered, never automatic.
+RECOVER_REVIEW_RUNNING_EVENT = "RECOVER_REVIEW_RUNNING"
+
+#: The human-authored reason recorded for that recovery (GUI default).
+RECOVER_REVIEW_RUNNING_REASON = (
+    "Human-authorized recovery of an interrupted Supervisor REVIEW "
+    "(no REVIEW result was persisted)."
+)
+
 VALID_STATES = {
     "PENDING",
     "READY_FOR_CODEX_PLAN",
@@ -229,6 +240,12 @@ ALLOWED_TRANSITIONS = {
         "REVISE",
         "BLOCKED",
         CODEX_REVIEW_RETRYABLE,
+        # The ONE explicit recovery edge, reachable ONLY through
+        # TandemController.recover_review_running_to_received (preconditions +
+        # dedicated RECOVER_REVIEW_RUNNING audit event). It restores exactly the
+        # state needed to re-run the review for the SAME attempt; it is never a
+        # generic "go back" door.
+        "CLINE_REPORT_RECEIVED",
         "FAILED",
     },
     # Reached ONLY from CODEX_REVIEW_RUNNING and only for a classified
@@ -1414,6 +1431,92 @@ class TandemDB:
         ).fetchone()
         return row is not None
 
+    def recover_review_running_to_received(
+        self,
+        step_no: int,
+        *,
+        actor: str,
+        reason: str,
+        report_hash: str,
+        attempt: int,
+    ) -> None:
+        """The ONE explicit recovery edge: ``CODEX_REVIEW_RUNNING -> CLINE_REPORT_RECEIVED``.
+
+        Used when a Supervisor REVIEW was INTERRUPTED (crash/restart) after the
+        state moved to ``CODEX_REVIEW_RUNNING`` but before any review was
+        persisted. Unlike :meth:`recover_failed_review_to_received` this edge is
+        declared in :data:`ALLOWED_TRANSITIONS`; the state change, the standard
+        ``STATE:`` event and the dedicated :data:`RECOVER_REVIEW_RUNNING_EVENT`
+        audit row are written in ONE transaction.
+
+        Fail closed here (the controller re-checks the report identity first):
+
+        * the step must currently be in ``CODEX_REVIEW_RUNNING``;
+        * NO review may already exist for this step+attempt (a persisted
+          terminal REVIEW result must never be walked back);
+        * the recovery may be used at most ONCE per step.
+
+        The attempt counter and every artifact (accepted Cline report, plan,
+        reports, reviews) are never touched; no Cline or PLAN work is re-run.
+        """
+        step = self.get_step(step_no)
+        if step.state != "CODEX_REVIEW_RUNNING":
+            raise RuntimeError(
+                "recover_review_running_to_received requires "
+                f"CODEX_REVIEW_RUNNING, got {step.state}"
+            )
+        if "CLINE_REPORT_RECEIVED" not in ALLOWED_TRANSITIONS.get(step.state, set()):
+            # Defensive: the recovery edge must stay a declared FSM transition.
+            raise RuntimeError(
+                "recovery edge CODEX_REVIEW_RUNNING -> CLINE_REPORT_RECEIVED "
+                "is not declared in ALLOWED_TRANSITIONS"
+            )
+        if self.has_codex_review(step_no, attempt):
+            raise RuntimeError(
+                f"Step {step_no} attempt {attempt} already has a Codex review; "
+                "refusing to recover over a persisted REVIEW result."
+            )
+        if self.has_event(step_no, RECOVER_REVIEW_RUNNING_EVENT):
+            raise RuntimeError(
+                "Interrupted-REVIEW recovery has already been used for this "
+                "step; refusing a second run."
+            )
+
+        ts = now_iso()
+        details = json.dumps(
+            {
+                "actor": actor or "human",
+                "reason": sanitize_diagnostic(reason or "interrupted REVIEW"),
+                "operation": RECOVER_REVIEW_RUNNING_EVENT,
+                "from_state": "CODEX_REVIEW_RUNNING",
+                "to_state": "CLINE_REPORT_RECEIVED",
+                "step_no": step_no,
+                "attempt": attempt,
+                "accepted_report_hash": report_hash,
+                "timestamp": ts,
+            },
+            ensure_ascii=False,
+        )
+        with self.db:
+            self.db.execute(
+                "UPDATE steps SET state='CLINE_REPORT_RECEIVED', last_update_at=? "
+                "WHERE step_no=?",
+                (ts, step_no),
+            )
+            self.db.execute(
+                "INSERT INTO events(step_no,event_type,details,created_at) VALUES(?,?,?,?)",
+                (
+                    step_no,
+                    "STATE:CODEX_REVIEW_RUNNING->CLINE_REPORT_RECEIVED",
+                    "Explicit human recovery of an interrupted Supervisor REVIEW.",
+                    ts,
+                ),
+            )
+            self.db.execute(
+                "INSERT INTO events(step_no,event_type,details,created_at) VALUES(?,?,?,?)",
+                (step_no, RECOVER_REVIEW_RUNNING_EVENT, details, ts),
+            )
+
     def recover_failed_review_to_received(
         self,
         step_no: int,
@@ -1927,17 +2030,12 @@ _CODEX_PROVIDER_UNAVAILABLE_MARKERS = (
 )
 
 
-def sanitize_diagnostic(text: Any, max_chars: int = 800) -> str:
-    """One-line, credential-redacted provider diagnostic safe to persist."""
-    value = str(text or "").replace("\x00", " ").strip()
-    value = " ".join(value.split())
-    value = re.sub(
-        r"(?i)(api[_-]?key|access[_-]?token|refresh[_-]?token|authorization|bearer)"
-        r"(\s*[:=]\s*|\s+)\S+",
-        r"\1\2***",
-        value,
-    )
-    return value[:max_chars]
+#: NOTE: there is deliberately NO module-local ``sanitize_diagnostic`` here.
+#: ``supervisor.errors.sanitize_diagnostic`` (imported above) is the ONE
+#: credential-redacting sanitizer and is used everywhere in this module. A weaker
+#: local copy used to shadow it, which let key-shaped tokens reach the audit
+#: trail verbatim (K1 regression test:
+#: ``test_module_sanitizer_is_the_strong_supervisor_implementation``).
 
 
 def _as_text(value: Any) -> str:
@@ -4035,6 +4133,127 @@ Return only structured JSON.
             "report_hash": stored_hash,
         }
 
+    # -- interrupted-REVIEW recovery (K1) ------------------------------------ #
+
+    def _interrupted_review_recovery_problems(self, step: TandemStep) -> list[str]:
+        """Every reason the interrupted-REVIEW recovery must refuse (in order).
+
+        Read-only. The attempt association comes from the DB row: the report is
+        looked up by ``(step_no, step.attempt)``, so a report for another attempt
+        can never be used. Fail closed on the first doubt.
+        """
+        problems: list[str] = []
+        if step.state != "CODEX_REVIEW_RUNNING":
+            problems.append(f"state must be CODEX_REVIEW_RUNNING, got {step.state}")
+        if int(step.attempt or 0) < 1:
+            problems.append("the current step has no valid attempt")
+        current = self.db.current_step()
+        if current is None or current.step_no != step.step_no:
+            problems.append("the step is no longer the current step")
+
+        stored = self.db.cline_report_for_attempt(step.step_no, step.attempt)
+        if stored is None:
+            problems.append(
+                f"step {step.step_no} attempt {step.attempt} has no accepted "
+                "Cline report"
+            )
+            return problems
+        report, stored_hash = stored
+        if int(report.get("step_no", -1)) != step.step_no:
+            problems.append("the accepted report does not belong to the current step")
+        report_problems = validate_cline_report(report, step.step_no)
+        if report_problems:
+            problems.append(
+                "the accepted report is not valid: " + "; ".join(report_problems[:3])
+            )
+        recomputed = sha256_text(
+            json.dumps(report, ensure_ascii=False, sort_keys=True, indent=2)
+        )
+        if recomputed != stored_hash:
+            problems.append("the accepted report does not match its stored hash")
+        if self.db.has_codex_review(step.step_no, step.attempt):
+            problems.append(
+                "a REVIEW result is already persisted for this step/attempt"
+            )
+        if self.db.has_event(step.step_no, RECOVER_REVIEW_RUNNING_EVENT):
+            problems.append(
+                "the interrupted-REVIEW recovery was already used for this step"
+            )
+        return problems
+
+    def review_running_recovery_qualified(self) -> bool:
+        """Read-only: may the interrupted-REVIEW recovery run right now?
+
+        Mirrors every precondition of
+        :meth:`recover_review_running_to_received` so the GUI only offers the
+        recovery when it would actually succeed.
+        """
+        try:
+            step = self.db.current_step()
+        except Exception:
+            return False
+        if not step:
+            return False
+        return not self._interrupted_review_recovery_problems(step)
+
+    def recover_review_running_to_received(
+        self, *, actor: str = "human", reason: str = ""
+    ) -> dict:
+        """Explicit, audited recovery of an INTERRUPTED Supervisor REVIEW.
+
+        Restores ONLY ``CODEX_REVIEW_RUNNING -> CLINE_REPORT_RECEIVED`` so the
+        human can re-run REVIEW for the SAME attempt. It never increments the
+        attempt, never re-runs PLAN, never re-runs Cline, never touches the
+        accepted report, and it never runs a provider request by itself.
+
+        Preconditions (any failure => fail closed, nothing is written): the
+        current state is CODEX_REVIEW_RUNNING, the accepted Cline report exists
+        for the current step AND current attempt, it passes the existing Cline
+        report validation and matches its stored hash, no REVIEW result is
+        persisted for that attempt, no step advance happened, and the recovery
+        was not used before.
+        """
+        step = self.db.current_step()
+        if not step:
+            raise RuntimeError("No active step.")
+        problems = self._interrupted_review_recovery_problems(step)
+        if problems:
+            raise RuntimeError(
+                "Interrupted-REVIEW recovery is not available: "
+                + "; ".join(problems)
+            )
+        stored = self.db.cline_report_for_attempt(step.step_no, step.attempt)
+        assert stored is not None  # guaranteed by the precondition check above
+        _report, stored_hash = stored
+        attempt_before = step.attempt
+
+        self.db.recover_review_running_to_received(
+            step.step_no,
+            actor=actor or "human",
+            reason=reason or RECOVER_REVIEW_RUNNING_REASON,
+            report_hash=stored_hash,
+            attempt=step.attempt,
+        )
+        after = self.db.get_step(step.step_no)
+        if after.attempt != attempt_before:
+            raise RuntimeError(
+                "Internal error: interrupted-REVIEW recovery changed the "
+                "attempt count."
+            )
+        if after.state != "CLINE_REPORT_RECEIVED":
+            raise RuntimeError(
+                "Internal error: interrupted-REVIEW recovery did not restore "
+                "CLINE_REPORT_RECEIVED."
+            )
+        return {
+            "step_no": after.step_no,
+            "attempt": after.attempt,
+            "state": after.state,
+            "report_hash": stored_hash,
+            "from_state": "CODEX_REVIEW_RUNNING",
+            "to_state": "CLINE_REPORT_RECEIVED",
+        }
+
     def retry_codex_review(self) -> dict:
         """Backward-compatible alias (M4)."""
         return self.retry_supervisor_review()
@@ -4157,6 +4376,8 @@ class TandemGUI:
         self.state_var = tk.StringVar(value="State: —")
         self.codex_var = tk.StringVar(value="Codex: not checked")
         self.supervisor_var = tk.StringVar(value="Supervisor: —")
+        #: Interrupted-REVIEW recoverable status (read-only; set by ``refresh``).
+        self.recovery_var = tk.StringVar(value="Recovery: —")
         self.footer_var = tk.StringVar(value="Worker_tandem is separate from Mini Worker.")
 
         # Cline report readiness watcher (Tk-safe polling; detection only).
@@ -4239,6 +4460,7 @@ class TandemGUI:
             self.progress_var,
             self.current_var,
             self.state_var,
+            self.recovery_var,
             self.cline_report_var,
             self.codex_var,
             self.supervisor_var,
@@ -4299,6 +4521,19 @@ class TandemGUI:
             command=self.sync_from_canonical_plan,
         )
         self.btn_sync.grid(row=2, column=0, padx=4, pady=4, sticky="ew")
+
+        # Explicit, audited recovery of a REVIEW that was INTERRUPTED while
+        # running (crash/restart before the result was persisted). Enabled only
+        # in CODEX_REVIEW_RUNNING, requires confirmation, and NEVER runs a
+        # provider request by itself - the human re-runs REVIEW afterwards.
+        self.btn_recover_review = ttk.Button(
+            actions,
+            text="Recover Interrupted REVIEW",
+            command=self.recover_interrupted_review,
+        )
+        self.btn_recover_review.grid(
+            row=3, column=0, columnspan=3, padx=4, pady=4, sticky="ew"
+        )
 
         for i in range(3):
             actions.columnconfigure(i, weight=1)
@@ -4961,6 +5196,68 @@ class TandemGUI:
         except Exception:
             return False
 
+    def _review_running_recovery_qualified(self) -> bool:
+        """Read-only check for the one-time interrupted-REVIEW recovery."""
+        if not self.controller:
+            return False
+        try:
+            return self.controller.review_running_recovery_qualified()
+        except Exception:
+            return False
+
+    def recover_interrupted_review(self) -> None:
+        """Explicit human recovery of a REVIEW interrupted while running.
+
+        Restores CODEX_REVIEW_RUNNING -> CLINE_REPORT_RECEIVED for the SAME
+        attempt so the normal "Run Supervisor REVIEW" flow can continue. It
+        never increments the attempt, never re-runs PLAN or Cline, never touches
+        the accepted Cline report, and it never runs a provider request here.
+        """
+        if not self.controller:
+            return
+        step = self.controller.db.current_step()
+        if not step or step.state != "CODEX_REVIEW_RUNNING":
+            messagebox.showerror(
+                APP_NAME,
+                "Interrupted-REVIEW recovery requires the state "
+                "CODEX_REVIEW_RUNNING.",
+            )
+            return
+        if not self._review_running_recovery_qualified():
+            messagebox.showerror(
+                APP_NAME,
+                "Interrupted-REVIEW recovery is not available for this step.\n\n"
+                "It requires: state CODEX_REVIEW_RUNNING, an accepted Cline report "
+                "for the current step AND attempt, a report that still matches its "
+                "stored hash, no REVIEW result persisted for the attempt, and no "
+                "earlier recovery for this step.",
+            )
+            return
+        if not messagebox.askyesno(
+            APP_NAME,
+            f"Recover the interrupted REVIEW for STEP {step.step_no} "
+            f"(attempt {step.attempt})?\n\n"
+            "This restores CODEX_REVIEW_RUNNING -> CLINE_REPORT_RECEIVED so the "
+            "REVIEW can be run again for the SAME attempt.\n\n"
+            "It does NOT change the attempt count, does NOT re-run Cline, does NOT "
+            "re-run PLAN and does NOT start the REVIEW automatically. The accepted "
+            "Cline report is preserved. This recovery is one-time and audited.",
+        ):
+            return
+        try:
+            recovered = self.controller.recover_review_running_to_received(
+                actor="human", reason=RECOVER_REVIEW_RUNNING_REASON
+            )
+        except Exception as exc:
+            messagebox.showerror(APP_NAME, str(exc))
+            return
+        self.footer_var.set(
+            f"STEP {recovered['step_no']} recovered to {recovered['state']} "
+            f"(attempt {recovered['attempt']} unchanged). "
+            "Run Supervisor REVIEW when ready."
+        )
+        self.refresh()
+
     def retry_codex_review(self) -> None:
         if not self.controller:
             return
@@ -5390,6 +5687,7 @@ class TandemGUI:
     def refresh(self) -> None:
         if not self.controller:
             self.supervisor_var.set("Supervisor: —")
+            self.recovery_var.set("Recovery: —")
             self._refresh_supervisor_section()
             self._refresh_cline_report_status()
             self._stop_report_watcher()
@@ -5416,6 +5714,24 @@ class TandemGUI:
                 f"State: {current.state} | risk {current.risk} | "
                 f"{'HUMAN' if current.requires_human else 'policy'}"
             )
+            # A REVIEW that is still "running" after a reopen means the previous
+            # run was interrupted before its result was persisted. Show that
+            # clearly; recovering is ALWAYS an explicit human action.
+            if current.state == "CODEX_REVIEW_RUNNING":
+                if self._review_running_recovery_qualified():
+                    self.recovery_var.set(
+                        f"Recovery: interrupted REVIEW at STEP {current.step_no} "
+                        f"(attempt {current.attempt}) — click "
+                        "'Recover Interrupted REVIEW'."
+                    )
+                else:
+                    self.recovery_var.set(
+                        f"Recovery: interrupted REVIEW at STEP {current.step_no} "
+                        f"(attempt {current.attempt}) — not recoverable "
+                        "(see the status dialog)."
+                    )
+            else:
+                self.recovery_var.set("Recovery: —")
 
             detail_parts = []
             plan = self.controller.db.latest_codex_plan(current.step_no)
@@ -5432,6 +5748,7 @@ class TandemGUI:
         else:
             self.current_var.set("Current: plan complete")
             self.state_var.set("State: —")
+            self.recovery_var.set("Recovery: —")
 
         for item in self.step_tree.get_children():
             self.step_tree.delete(item)
@@ -5479,6 +5796,13 @@ class TandemGUI:
             self.btn_retry_review,
             state == CODEX_REVIEW_RETRYABLE
             or (state == "FAILED" and self._review_recovery_qualified()),
+        )
+        # Recover Interrupted REVIEW: ONLY for a REVIEW that is still running
+        # (i.e. it was interrupted before any result was persisted) and only when
+        # every recovery precondition holds.
+        set_state(
+            self.btn_recover_review,
+            state == "CODEX_REVIEW_RUNNING" and self._review_running_recovery_qualified(),
         )
 
         # Canonical-plan sync is a manual maintenance action: allowed whenever a
